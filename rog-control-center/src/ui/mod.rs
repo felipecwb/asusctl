@@ -32,7 +32,11 @@ use crate::{AppSettingsPageData, GlobalShortcutStatus, MainWindow};
 // conv1 and conv2 are type conversion args
 #[macro_export]
 macro_rules! set_ui_callbacks {
-    ($handle:ident, $data:ident($($conv1: tt)*),$proxy:ident.$proxy_fn:tt($($conv2: tt)*),$success:literal,$failed:literal) => {
+    (@success $message:literal, $value:ident, reset_on_error) => { $message };
+    (@success $message:literal, $value:ident) => { format!($message, $value) };
+    (@reset_on_error $result:ident) => { false };
+    (@reset_on_error $result:ident, reset_on_error) => { $result.is_err() };
+    ($handle:ident, $data:ident($($conv1: tt)*),$proxy:ident.$proxy_fn:tt($($conv2: tt)*),$success:literal,$failed:literal $(, $mode:ident)?) => {
         let handle_copy = $handle.as_weak();
         let proxy_copy = $proxy.clone();
         let data = $handle.global::<$data>();
@@ -42,12 +46,15 @@ macro_rules! set_ui_callbacks {
             let handle_copy = handle_copy.clone();
             tokio::spawn(async move {
                 concat_idents::concat_idents!(set = set_, $proxy_fn {
-                show_toast(
-                    format!($success, value).into(),
-                    $failed.into(),
-                    handle_copy,
-                    proxy_copy.set(value $($conv2)*).await,
-                );
+                let success = $crate::set_ui_callbacks!(@success $success, value $(, $mode)?);
+                let result = proxy_copy.set(value $($conv2)*).await;
+                let reset = $crate::set_ui_callbacks!(@reset_on_error result $(, $mode)?);
+                if reset && let Ok(out) = proxy_copy.$proxy_fn().await {
+                    handle_copy.upgrade_in_event_loop(move |handle| {
+                        handle.global::<$data>().set(out $($conv1)*);
+                    }).ok();
+                }
+                show_toast(success.into(), $failed.into(), handle_copy, result);
                 });
             });
             });

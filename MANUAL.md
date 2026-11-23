@@ -99,6 +99,16 @@ A common use of asusctl is to bind the `fn+f5` (fan) key to `asusctl profile -n`
 2. Performance
 3. Quiet
 
+#### CPU boost
+
+In ROG Control Center, open the advanced throttle settings on the System page to set CPU Boost per platform profile. Quiet and Low Power share a setting. The controls appear only on systems where the daemon detects a kernel boost control.
+
+- **Enabled** allows boost when the hardware, firmware and thermal limits permit it; it does not force the CPU to run at boost frequencies.
+- **Disabled** disallows boost.
+- **Leave unchanged** (the default) makes `asusd` leave the current kernel setting alone. It does not restore a default or undo a setting applied by another profile.
+
+Boost is independent of the EPP link. The same profile uses the same boost setting on AC and battery. If another service manages CPU boost, leave these settings at **Leave unchanged** to avoid conflicts.
+
 #### Fan curves
 
 Fan curve support requires a laptop that supports it (this is detected automatically) and the kernel patch from [here](https://lkml.org/lkml/2021/10/23/250) which is accepted for the 5.17 kernel release .

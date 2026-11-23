@@ -6,7 +6,7 @@ use rog_dbus::asus_armoury::AsusArmouryProxy;
 use rog_dbus::zbus_backlight::BacklightProxy;
 use rog_dbus::zbus_platform::{PlatformProxy, PlatformProxyBlocking};
 use rog_platform::asus_armoury::FirmwareAttribute;
-use rog_platform::platform::Properties;
+use rog_platform::platform::{PlatformProfile, Properties};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::show_toast;
@@ -448,8 +448,15 @@ pub fn setup_system_page_callbacks(ui: &MainWindow, _states: Arc<Mutex<Config>>)
         );
 
         let platform_copy = platform.clone();
+        let boost_supported = platform.cpu_boost_supported().await.unwrap_or(false);
         if let Ok(mut value) = platform.platform_profile_choices().await {
             debug!("Available platform profile choices: {:?}", value);
+            if boost_supported {
+                set_ui_props_async!(handle, platform, SystemPageData, profile_balanced_boost);
+                set_ui_props_async!(handle, platform, SystemPageData, profile_performance_boost);
+                set_ui_props_async!(handle, platform, SystemPageData, profile_quiet_boost);
+                set_ui_props_async!(handle, platform, SystemPageData, profile_custom_boost);
+            }
             handle
                 .upgrade_in_event_loop(move |handle| {
                     value.sort();
@@ -458,6 +465,18 @@ pub fn setup_system_page_callbacks(ui: &MainWindow, _states: Arc<Mutex<Config>>)
                         .get_platform_profile_choices()
                         .iter()
                         .collect();
+                    if boost_supported {
+                        let data = handle.global::<SystemPageData>();
+                        data.set_show_balanced_boost(value.contains(&PlatformProfile::Balanced));
+                        data.set_show_performance_boost(
+                            value.contains(&PlatformProfile::Performance),
+                        );
+                        data.set_show_quiet_boost(
+                            value.contains(&PlatformProfile::Quiet)
+                                || value.contains(&PlatformProfile::LowPower),
+                        );
+                        data.set_show_custom_boost(value.contains(&PlatformProfile::Custom));
+                    }
                     let mut indexes = Vec::new();
                     let strings: Vec<SharedString> = value
                         .iter()
@@ -639,6 +658,36 @@ pub fn setup_system_page_callbacks(ui: &MainWindow, _states: Arc<Mutex<Config>>)
                     "Throttle policy EPP set to {}",
                     "Setting Throttle policy EPP failed"
                 );
+                if boost_supported {
+                    set_ui_callbacks!(handle,
+                        SystemPageData(as i32),
+                        platform_copy.profile_balanced_boost(.into()),
+                        "Balanced CPU boost preference saved",
+                        "Setting Balanced CPU boost failed",
+                        reset_on_error
+                    );
+                    set_ui_callbacks!(handle,
+                        SystemPageData(as i32),
+                        platform_copy.profile_performance_boost(.into()),
+                        "Performance CPU boost preference saved",
+                        "Setting Performance CPU boost failed",
+                        reset_on_error
+                    );
+                    set_ui_callbacks!(handle,
+                        SystemPageData(as i32),
+                        platform_copy.profile_quiet_boost(.into()),
+                        "Quiet / Low Power CPU boost preference saved",
+                        "Setting Quiet / Low Power CPU boost failed",
+                        reset_on_error
+                    );
+                    set_ui_callbacks!(handle,
+                        SystemPageData(as i32),
+                        platform_copy.profile_custom_boost(.into()),
+                        "Custom CPU boost preference saved",
+                        "Setting Custom CPU boost failed",
+                        reset_on_error
+                    );
+                }
                 set_ui_callbacks!(
                     handle,
                     SystemPageData(),

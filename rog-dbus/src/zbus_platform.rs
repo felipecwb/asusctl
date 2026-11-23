@@ -20,7 +20,7 @@
 //!
 //! …consequently `zbus-xmlgen` did not generate code for the above interfaces.
 
-use rog_platform::cpu::CPUEPP;
+use rog_platform::cpu::{CPUBoost, CPUEPP};
 use rog_platform::platform::{PlatformProfile, Properties};
 use zbus::proxy;
 
@@ -59,6 +59,30 @@ pub trait Platform {
     fn profile_performance_epp(&self) -> zbus::Result<CPUEPP>;
     #[zbus(property)]
     fn set_profile_performance_epp(&self, epp: CPUEPP) -> zbus::Result<()>;
+
+    /// Whether the platform profile can control CPU boost.
+    fn cpu_boost_supported(&self) -> zbus::Result<bool>;
+
+    #[zbus(property)]
+    fn profile_balanced_boost(&self) -> zbus::Result<CPUBoost>;
+    #[zbus(property)]
+    fn set_profile_balanced_boost(&self, boost: CPUBoost) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn profile_performance_boost(&self) -> zbus::Result<CPUBoost>;
+    #[zbus(property)]
+    fn set_profile_performance_boost(&self, boost: CPUBoost) -> zbus::Result<()>;
+
+    /// Applies to both Quiet and Low Power.
+    #[zbus(property)]
+    fn profile_quiet_boost(&self) -> zbus::Result<CPUBoost>;
+    #[zbus(property)]
+    fn set_profile_quiet_boost(&self, boost: CPUBoost) -> zbus::Result<()>;
+
+    #[zbus(property)]
+    fn profile_custom_boost(&self) -> zbus::Result<CPUBoost>;
+    #[zbus(property)]
+    fn set_profile_custom_boost(&self, boost: CPUBoost) -> zbus::Result<()>;
 
     /// ThrottlePolicyLinkedEpp property
     #[zbus(property)]

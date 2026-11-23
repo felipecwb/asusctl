@@ -5,9 +5,10 @@ use std::sync::Arc;
 use config_traits::StdConfig;
 use log::{debug, error, info, warn};
 use rog_platform::asus_armoury::FirmwareAttributes;
-use rog_platform::cpu::{CPUControl, CPUEPP, CPUGovernor};
+use rog_platform::cpu::{CPUBoost, CPUControl, CPUEPP, CPUGovernor, has_cpu_boost, set_cpu_boost};
 use rog_platform::platform::{PlatformProfile, Properties, RogPlatform};
 use rog_platform::power::AsusPower;
+use rog_profiles::find_fan_curve_node;
 use tokio::sync::Mutex;
 use zbus::fdo::Error as FdoErr;
 use zbus::object_server::SignalEmitter;
@@ -17,7 +18,6 @@ use crate::asus_armoury::{ArmouryAttributeRegistry, set_config_or_default};
 use crate::config::Config;
 use crate::error::RogError;
 use crate::{CtrlTask, ReloadAndNotify, task_watch_item};
-use rog_profiles::find_fan_curve_node;
 
 const PLATFORM_ZBUS_PATH: &str = "/xyz/ljones";
 
@@ -186,16 +186,19 @@ impl CtrlPlatform {
         }
     }
 
-    /// Write the platform profile and restore the fan curves it just wiped.
-    ///
-    /// This is the only sanctioned way to set the profile from this type;
-    /// calling `self.platform.set_platform_profile()` directly leaves the
-    /// custom fan curves disabled.
+    /// Write the platform profile, apply its CPU settings, and restore the fan
+    /// curves it just wiped. Writing the profile directly skips those steps.
     async fn write_platform_profile(
         &self,
         profile: PlatformProfile,
     ) -> Result<(), rog_platform::error::PlatformError> {
-        self.platform.set_platform_profile(profile.into())?;
+        {
+            let config = self.config.lock().await;
+            self.platform.set_platform_profile(profile.into())?;
+            if let Ok(active) = self.platform.get_platform_profile() {
+                self.apply_cpu_settings(&config, active.into());
+            }
+        }
         self.reapply_fan_curves(profile).await;
         Ok(())
     }
@@ -284,14 +287,56 @@ impl CtrlPlatform {
         }
     }
 
-    async fn get_config_epp_for_throttle(&self, throttle: PlatformProfile) -> CPUEPP {
-        match throttle {
-            PlatformProfile::Balanced => self.config.lock().await.profile_balanced_epp,
-            PlatformProfile::Performance => self.config.lock().await.profile_performance_epp,
-            PlatformProfile::Quiet => self.config.lock().await.profile_quiet_epp,
-            PlatformProfile::LowPower => self.config.lock().await.profile_quiet_epp,
-            PlatformProfile::Custom => self.config.lock().await.profile_custom_epp,
+    async fn apply_active_cpu_settings(&self) {
+        // Re-read the active profile after acquiring the config lock. A queued
+        // profile event must not apply CPU settings for a profile we already left.
+        let config = self.config.lock().await;
+        if let Ok(profile) = self.platform.get_platform_profile() {
+            self.apply_cpu_settings(&config, profile.into());
         }
+    }
+
+    fn apply_cpu_settings(&self, config: &Config, profile: PlatformProfile) {
+        self.check_and_set_epp(
+            config.profile_epp(profile),
+            config.platform_profile_linked_epp,
+        );
+        Self::apply_boost_best_effort(config.profile_cpu_boost.get(profile));
+    }
+
+    fn apply_boost_best_effort(boost: CPUBoost) {
+        if let Some(enabled) = boost.enabled() {
+            match set_cpu_boost(enabled) {
+                Ok(()) | Err(rog_platform::error::PlatformError::NotSupported) => {}
+                Err(err) => warn!("Failed to apply CPU boost preference {boost:?}: {err}"),
+            }
+        }
+    }
+
+    async fn set_profile_cpu_boost(
+        &self,
+        profile: PlatformProfile,
+        boost: CPUBoost,
+    ) -> Result<(), FdoErr> {
+        if !self.cpu_boost_supported() {
+            return Err(FdoErr::NotSupported(
+                "CPU boost control is unavailable".into(),
+            ));
+        }
+
+        let mut config = self.config.lock().await;
+        let mut updated = config.profile_cpu_boost;
+        updated.set(profile, boost);
+        let active = PlatformProfile::from(self.platform.get_platform_profile()?);
+        if let Some(enabled) = updated
+            .changed_policy_for(config.profile_cpu_boost, active)
+            .and_then(CPUBoost::enabled)
+        {
+            set_cpu_boost(enabled)?;
+        }
+        config.profile_cpu_boost = updated;
+        config.write();
+        Ok(())
     }
 
     async fn select_power_profile_for_source(&self, power_plugged: bool) -> PlatformProfile {
@@ -362,30 +407,29 @@ impl CtrlPlatform {
         }
     }
 
-    async fn update_policy_ac_or_bat(&self, power_plugged: bool, change_epp: bool) {
+    /// Returns whether an automatic platform-profile switch was applied.
+    async fn update_policy_ac_or_bat(&self, power_plugged: bool) -> bool {
         if power_plugged && !self.config.lock().await.change_platform_profile_on_ac {
             debug!(
                 "Power status changed but set_platform_profile_on_ac set false. Not setting the \
                  thing"
             );
-            return;
+            return false;
         }
         if !power_plugged && !self.config.lock().await.change_platform_profile_on_battery {
             debug!(
                 "Power status changed but set_platform_profile_on_battery set false. Not setting \
                  the thing"
             );
-            return;
+            return false;
         }
 
         let throttle = self.select_power_profile_for_source(power_plugged).await;
-        debug!("Setting {throttle:?} before EPP");
-        let epp = self.get_config_epp_for_throttle(throttle).await;
         if let Err(err) = self.write_platform_profile(throttle).await {
             warn!("Failed to set platform profile {throttle:?} on AC/BAT change: {err}");
-            return;
+            return false;
         }
-        self.check_and_set_epp(epp, change_epp);
+        true
     }
 }
 
@@ -508,9 +552,6 @@ impl CtrlPlatform {
         let policy = PlatformProfile::next(policy, &choices);
 
         if self.platform.has_platform_profile() {
-            let change_epp = self.config.lock().await.platform_profile_linked_epp;
-            let epp = self.get_config_epp_for_throttle(policy).await;
-            self.check_and_set_epp(epp, change_epp);
             self.write_platform_profile(policy).await.map_err(|err| {
                 warn!("platform_profile {}", err);
                 FdoErr::Failed(format!("RogPlatform: platform_profile: {err}"))
@@ -541,14 +582,7 @@ impl CtrlPlatform {
         #[zbus(signal_context)] ctxt: SignalEmitter<'_>,
         policy: PlatformProfile,
     ) -> Result<(), FdoErr> {
-        // TODO: watch for external changes
         if self.platform.has_platform_profile() {
-            let change_epp = self.config.lock().await.platform_profile_linked_epp;
-            let epp = self.get_config_epp_for_throttle(policy).await;
-            self.check_and_set_epp(epp, change_epp);
-
-            self.config.lock().await.write();
-
             let choices = self.platform.get_platform_profile_choices()?;
             let policy = policy.resolve_alias(&choices);
             if !choices.contains(&policy) {
@@ -702,6 +736,70 @@ impl CtrlPlatform {
         Ok(())
     }
 
+    fn cpu_boost_supported(&self) -> bool {
+        self.platform.has_platform_profile() && has_cpu_boost()
+    }
+
+    #[zbus(property)]
+    async fn profile_balanced_boost(&self) -> CPUBoost {
+        self.config
+            .lock()
+            .await
+            .profile_cpu_boost
+            .get(PlatformProfile::Balanced)
+    }
+
+    #[zbus(property)]
+    async fn set_profile_balanced_boost(&self, boost: CPUBoost) -> Result<(), FdoErr> {
+        self.set_profile_cpu_boost(PlatformProfile::Balanced, boost)
+            .await
+    }
+
+    #[zbus(property)]
+    async fn profile_performance_boost(&self) -> CPUBoost {
+        self.config
+            .lock()
+            .await
+            .profile_cpu_boost
+            .get(PlatformProfile::Performance)
+    }
+
+    #[zbus(property)]
+    async fn set_profile_performance_boost(&self, boost: CPUBoost) -> Result<(), FdoErr> {
+        self.set_profile_cpu_boost(PlatformProfile::Performance, boost)
+            .await
+    }
+
+    #[zbus(property)]
+    async fn profile_quiet_boost(&self) -> CPUBoost {
+        self.config
+            .lock()
+            .await
+            .profile_cpu_boost
+            .get(PlatformProfile::Quiet)
+    }
+
+    #[zbus(property)]
+    async fn set_profile_quiet_boost(&self, boost: CPUBoost) -> Result<(), FdoErr> {
+        self.set_profile_cpu_boost(PlatformProfile::Quiet, boost)
+            .await
+    }
+
+    #[zbus(property)]
+    async fn profile_custom_boost(&self) -> CPUBoost {
+        self.config
+            .lock()
+            .await
+            .profile_cpu_boost
+            .get(PlatformProfile::Custom)
+    }
+
+    #[zbus(property)]
+    async fn set_profile_custom_boost(&self, boost: CPUBoost) -> Result<(), FdoErr> {
+        self.set_profile_cpu_boost(PlatformProfile::Custom, boost)
+            .await
+    }
+
     /// Whether nvidia-powerd should be stopped when switching to battery
     #[zbus(property)]
     async fn disable_nvidia_powerd_on_battery(&self) -> Result<bool, FdoErr> {
@@ -837,22 +935,20 @@ impl ReloadAndNotify for CtrlPlatform {
                     .or(Some(limit));
             }
 
-            if self.platform.has_platform_profile()
-                && config.platform_profile_linked_epp != data.platform_profile_linked_epp
-            {
-                let profile: PlatformProfile = self.platform.get_platform_profile()?.into();
-
-                let epp = match profile {
-                    PlatformProfile::Balanced => data.profile_balanced_epp,
-                    PlatformProfile::Performance => data.profile_performance_epp,
-                    PlatformProfile::Quiet => data.profile_quiet_epp,
-                    PlatformProfile::LowPower => data.profile_quiet_epp,
-                    PlatformProfile::Custom => data.profile_custom_epp,
-                };
-                warn!("setting epp to {epp:?}");
-                self.check_and_set_epp(epp, true);
+            let previous_boost = config.profile_cpu_boost;
+            let updated_boost = data.profile_cpu_boost;
+            if let Ok(active) = self.platform.get_platform_profile() {
+                let active = PlatformProfile::from(active);
+                let epp = data.profile_epp(active);
+                if data.platform_profile_linked_epp
+                    && (!config.platform_profile_linked_epp || config.profile_epp(active) != epp)
+                {
+                    self.check_and_set_epp(epp, true);
+                }
+                if let Some(boost) = updated_boost.changed_policy_for(previous_boost, active) {
+                    Self::apply_boost_best_effort(boost);
+                }
             }
-            // reload_and_notify!(platform_profile, "platform_profile");
 
             *config = data;
             config.base_charge_control_end_threshold =
@@ -862,6 +958,27 @@ impl ReloadAndNotify for CtrlPlatform {
             // Drop the config lock before emitting to avoid deadlocking when
             // emit_limits attempts to lock the same config.
             drop(config);
+            if previous_boost.get(PlatformProfile::Balanced)
+                != updated_boost.get(PlatformProfile::Balanced)
+            {
+                self.profile_balanced_boost_changed(signal_context).await?;
+            }
+            if previous_boost.get(PlatformProfile::Performance)
+                != updated_boost.get(PlatformProfile::Performance)
+            {
+                self.profile_performance_boost_changed(signal_context)
+                    .await?;
+            }
+            if previous_boost.get(PlatformProfile::Quiet)
+                != updated_boost.get(PlatformProfile::Quiet)
+            {
+                self.profile_quiet_boost_changed(signal_context).await?;
+            }
+            if previous_boost.get(PlatformProfile::Custom)
+                != updated_boost.get(PlatformProfile::Custom)
+            {
+                self.profile_custom_boost_changed(signal_context).await?;
+            }
             let _ = self
                 .armoury_registry
                 .emit_limits(&self.connection)
@@ -884,14 +1001,16 @@ impl crate::Reloadable for CtrlPlatform {
             warn!("No charge_control_end_threshold found")
         }
 
+        let mut applied = false;
         if let Ok(power_plugged) = self.power.get_online() {
             self.config.lock().await.last_power_plugged = power_plugged;
             if self.platform.has_platform_profile() {
-                let change_epp = self.config.lock().await.platform_profile_linked_epp;
-                self.update_policy_ac_or_bat(power_plugged > 0, change_epp)
-                    .await;
+                applied = self.update_policy_ac_or_bat(power_plugged > 0).await;
             }
             self.run_ac_or_bat_cmd(power_plugged > 0).await;
+        }
+        if !applied {
+            self.apply_active_cpu_settings().await;
         }
 
         Ok(())
@@ -933,15 +1052,12 @@ impl CtrlTask for CtrlPlatform {
                             )
                             .ok();
                     }
+                    let mut applied = false;
                     if let Ok(power_plugged) = platform1.power.get_online()
                         && platform1.config.lock().await.last_power_plugged != power_plugged
                     {
                         if !sleeping && platform1.platform.has_platform_profile() {
-                            let change_epp =
-                                platform1.config.lock().await.platform_profile_linked_epp;
-                            platform1
-                                .update_policy_ac_or_bat(power_plugged > 0, change_epp)
-                                .await;
+                            applied = platform1.update_policy_ac_or_bat(power_plugged > 0).await;
                         }
                         if !sleeping {
                             platform1.run_ac_or_bat_cmd(power_plugged > 0).await;
@@ -965,6 +1081,9 @@ impl CtrlTask for CtrlPlatform {
                             }
                         }
                         platform1.config.lock().await.last_power_plugged = power_plugged;
+                    }
+                    if !sleeping && !applied {
+                        platform1.apply_active_cpu_settings().await;
                     }
                 }
             },
@@ -1001,10 +1120,7 @@ impl CtrlTask for CtrlPlatform {
                 // power change
                 async move {
                     if platform3.platform.has_platform_profile() {
-                        let change_epp = platform3.config.lock().await.platform_profile_linked_epp;
-                        platform3
-                            .update_policy_ac_or_bat(power_plugged, change_epp)
-                            .await;
+                        platform3.update_policy_ac_or_bat(power_plugged).await;
                     }
                     platform3.run_ac_or_bat_cmd(power_plugged).await;
                     platform3.manage_nvidia_powerd(power_plugged).await;
@@ -1069,9 +1185,7 @@ impl CtrlTask for CtrlPlatform {
                             error!("Platform: get_platform_profile error: {e}");
                         })
                     {
-                        let change_epp = ctrl.config.lock().await.platform_profile_linked_epp;
-                        let epp = ctrl.get_config_epp_for_throttle(profile).await;
-                        ctrl.check_and_set_epp(epp, change_epp);
+                        ctrl.apply_active_cpu_settings().await;
                         ctrl.platform_profile_changed(&signal_ctxt_copy).await.ok();
                         ctrl.enable_ppt_group_changed(&signal_ctxt_copy).await.ok();
                         let power_plugged = ctrl
