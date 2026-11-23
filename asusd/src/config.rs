@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use config_traits::{StdConfig, StdConfigLoad2};
 use rog_platform::asus_armoury::FirmwareAttribute;
-use rog_platform::cpu::CPUEPP;
+use rog_platform::cpu::{CPUBoost, CPUEPP};
 use rog_platform::platform::PlatformProfile;
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +20,42 @@ pub struct Tuning {
     pub group: HashMap<FirmwareAttribute, i32>,
 }
 type Tunings = HashMap<PlatformProfile, Tuning>;
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ProfileCpuBoost {
+    balanced: CPUBoost,
+    performance: CPUBoost,
+    quiet: CPUBoost,
+    custom: CPUBoost,
+}
+
+impl ProfileCpuBoost {
+    pub fn get(self, profile: PlatformProfile) -> CPUBoost {
+        match profile {
+            PlatformProfile::Balanced => self.balanced,
+            PlatformProfile::Performance => self.performance,
+            PlatformProfile::Quiet | PlatformProfile::LowPower => self.quiet,
+            PlatformProfile::Custom => self.custom,
+        }
+    }
+
+    pub fn set(&mut self, profile: PlatformProfile, boost: CPUBoost) {
+        match profile {
+            PlatformProfile::Balanced => self.balanced = boost,
+            PlatformProfile::Performance => self.performance = boost,
+            PlatformProfile::Quiet | PlatformProfile::LowPower => self.quiet = boost,
+            PlatformProfile::Custom => self.custom = boost,
+        }
+    }
+
+    /// Only return a new policy if the setting for the active profile was
+    /// edited.
+    pub fn changed_policy_for(self, previous: Self, active: PlatformProfile) -> Option<CPUBoost> {
+        let policy = self.get(active);
+        (policy != previous.get(active)).then_some(policy)
+    }
+}
 
 #[derive(Deserialize, Serialize, PartialEq)]
 pub struct Config {
@@ -52,6 +88,9 @@ pub struct Config {
     pub profile_custom_epp: CPUEPP,
     /// The energy_performance_preference for this platform profile
     pub profile_performance_epp: CPUEPP,
+    /// CPU boost behavior for each platform profile, independent of EPP.
+    #[serde(default)]
+    pub profile_cpu_boost: ProfileCpuBoost,
     pub ac_profile_tunings: Tunings,
     pub dc_profile_tunings: Tunings,
     pub armoury_settings: HashMap<FirmwareAttribute, i32>,
@@ -69,6 +108,15 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn profile_epp(&self, profile: PlatformProfile) -> CPUEPP {
+        match profile {
+            PlatformProfile::Balanced => self.profile_balanced_epp,
+            PlatformProfile::Performance => self.profile_performance_epp,
+            PlatformProfile::Quiet | PlatformProfile::LowPower => self.profile_quiet_epp,
+            PlatformProfile::Custom => self.profile_custom_epp,
+        }
+    }
+
     pub fn select_tunings(&mut self, power_plugged: bool, profile: PlatformProfile) -> &mut Tuning {
         let config = if power_plugged {
             &mut self.ac_profile_tunings
@@ -112,6 +160,7 @@ impl Default for Config {
             profile_balanced_epp: CPUEPP::BalancePower,
             profile_performance_epp: CPUEPP::Performance,
             profile_custom_epp: CPUEPP::Performance,
+            profile_cpu_boost: Default::default(),
             ac_profile_tunings: HashMap::default(),
             dc_profile_tunings: HashMap::default(),
             armoury_settings: HashMap::default(),
@@ -189,6 +238,7 @@ impl From<Config611> for Config {
             profile_balanced_epp: c.profile_balanced_epp,
             profile_performance_epp: c.profile_performance_epp,
             profile_custom_epp: c.profile_performance_epp,
+            profile_cpu_boost: Default::default(),
             last_power_plugged: c.last_power_plugged,
             ac_profile_tunings: HashMap::default(),
             dc_profile_tunings: HashMap::default(),
@@ -262,6 +312,7 @@ impl From<Config601> for Config {
             profile_balanced_epp: c.profile_balanced_epp,
             profile_performance_epp: c.profile_performance_epp,
             profile_custom_epp: c.profile_performance_epp,
+            profile_cpu_boost: Default::default(),
             last_power_plugged: c.last_power_plugged,
             ac_profile_tunings: HashMap::default(),
             dc_profile_tunings: HashMap::default(),
@@ -270,5 +321,62 @@ impl From<Config601> for Config {
             screenpad_sync_primary: Default::default(),
             xgm_led_enabled: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_without_boost_leaves_it_unchanged() {
+        let config = Config::default();
+        let ron = ron::to_string(&config).unwrap();
+        let boost = ron::to_string(&config.profile_cpu_boost).unwrap();
+        let field = format!("profile_cpu_boost:{boost},");
+        assert!(ron.contains(&field));
+        let restored: Config = ron::from_str(&ron.replace(&field, "")).unwrap();
+        assert_eq!(restored.profile_cpu_boost, ProfileCpuBoost::default());
+        assert_eq!(restored.profile_epp(PlatformProfile::Quiet), CPUEPP::Power);
+        assert_eq!(
+            restored
+                .profile_cpu_boost
+                .get(PlatformProfile::Quiet)
+                .enabled(),
+            None
+        );
+
+        let legacy: Config611 = ron::from_str(&ron).unwrap();
+        assert_eq!(
+            Config::from(legacy).profile_cpu_boost,
+            ProfileCpuBoost::default()
+        );
+    }
+
+    #[test]
+    fn only_an_edit_for_the_active_profile_applies_boost() {
+        let mut config = Config::default();
+        let before = config.profile_cpu_boost;
+        config
+            .profile_cpu_boost
+            .set(PlatformProfile::Quiet, CPUBoost::Disabled);
+        config
+            .profile_cpu_boost
+            .set(PlatformProfile::Custom, CPUBoost::Enabled);
+        let saved = ron::to_string(&config).unwrap();
+        let restored: Config = ron::from_str(&saved).unwrap();
+        let boost = restored.profile_cpu_boost;
+        assert_eq!(
+            boost.changed_policy_for(before, PlatformProfile::LowPower),
+            Some(CPUBoost::Disabled)
+        );
+        assert_eq!(
+            boost.changed_policy_for(before, PlatformProfile::Custom),
+            Some(CPUBoost::Enabled)
+        );
+        assert_eq!(
+            boost.changed_policy_for(before, PlatformProfile::Balanced),
+            None
+        );
     }
 }
